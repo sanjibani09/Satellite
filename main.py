@@ -9,7 +9,7 @@ from skyfield.api import EarthSatellite, load
 DB_CONFIG = {
     "dbname": "satellite_db",
     "user": "postgres",
-    "password": "gshekhar81461",
+    "password": "sanjibanipaul",
     "host": "localhost",
     "port": "5432"
 }
