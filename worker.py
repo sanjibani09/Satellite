@@ -1,22 +1,26 @@
 import asyncio
-import asyncpg # New async DB driver
+import asyncpg
 import redis
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from skyfield.api import EarthSatellite, load
 
-# --- Database Configuration (Using your updated config) ---
+# --- Global Constants ---
+PREDICT_SECONDS = 90 * 60        # 90 minutes ahead
+SAMPLE_INTERVAL = 30             # seconds between samples
+CACHE_KEY = "satellite_positions_v2"
+CACHE_TTL_SECONDS = 60           # refresh every minute
+
+# --- Database Configuration ---
 DB_CONFIG = {
     "database": "satellite_db",
     "user": "postgres",
-    "password": "sanjibanipaul",
+    "password": "sanjibanipaul",   # <-- update if needed
     "host": "localhost",
     "port": "5432"
 }
 
-# --- Cache Configuration ---
-CACHE_KEY = "satellite_positions_v2"
-CACHE_TTL_SECONDS = 60 # Align with our 1-minute refresh goal
+# --- Redis Configuration ---
 try:
     redis_client = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
     redis_client.ping()
@@ -28,50 +32,76 @@ except redis.exceptions.ConnectionError as e:
 # --- Skyfield Loader ---
 ts = load.timescale()
 
-# --- MODIFIED Calculation Function (for Step 2.3) ---
+# ==============================================================
+#  Satellite Position + Orbit Prediction Logic
+# ==============================================================
+
 def calculate_satellite_position(line1: str, line2: str):
     """
-    Calculates current satellite position using Skyfield.
-    Returns a dictionary containing:
-    - eci_pos: (x, y, z) tuple in ECI coordinates (km)
-    - geo_pos: (lat, lon, alt) tuple in degrees and km
+    Calculates current satellite position.
+    Returns dict with ECI (x, y, z) km and geodetic lat/lon/alt.
     """
     try:
-        t = ts.now()  # current UTC time
-        satellite = EarthSatellite(line1, line2)
-        
-        # 1. Get the ECI position vector
-        eci_position_vector = satellite.at(t).position.km
-        
-        # 2. Get the subpoint (geographic)
-        subpoint = satellite.at(t).subpoint()
+        t = ts.now()
+        sat = EarthSatellite(line1, line2)
 
-        # 3. Package and return
+        # Earth-Centered Inertial coordinates
+        eci = sat.at(t).position.km
+
+        # Geographic subpoint
+        sub = sat.at(t).subpoint()
         return {
-            "eci_pos": tuple(eci_position_vector), # (x, y, z)
+            "eci_pos": tuple(eci),
             "geo_pos": (
-                subpoint.latitude.degrees,
-                subpoint.longitude.degrees,
-                subpoint.elevation.km
+                sub.latitude.degrees,
+                sub.longitude.degrees,
+                sub.elevation.km
             )
         }
-
     except Exception as e:
-        print(f"Error in calculation: {e}")
+        print(f"Error calculating position: {e}")
         return None
 
 
+def compute_future_samples(line1: str, line2: str, predict_seconds=PREDICT_SECONDS, sample_interval=SAMPLE_INTERVAL):
+    """
+    Predicts future orbit samples (lat/lon/alt_km) over next N seconds.
+    """
+    samples = []
+    now_dt_utc = datetime.now(timezone.utc)
+    n = int(predict_seconds // sample_interval) + 1
+    sat = EarthSatellite(line1, line2)
+
+    for i in range(n):
+        t_dt = now_dt_utc + timedelta(seconds=i * sample_interval)
+        t_sf = ts.utc(
+            t_dt.year, t_dt.month, t_dt.day,
+            t_dt.hour, t_dt.minute, t_dt.second + t_dt.microsecond / 1e6
+        )
+        sub = sat.at(t_sf).subpoint()
+        samples.append({
+            "t": t_dt.isoformat(),
+            "lat": sub.latitude.degrees,
+            "lon": sub.longitude.degrees,
+            "alt_km": sub.elevation.km
+        })
+    return samples
+
+# ==============================================================
+#  Async Worker Logic
+# ==============================================================
+
 async def fetch_and_calculate(pool):
     """
-    The main logic function for the worker.
+    Fetch latest TLEs, compute positions + predictions,
+    update PostGIS, cache results in Redis.
     """
     print(f"[{datetime.now()}] Worker cycle starting: Fetching TLEs...")
-    
-    satellites_data = [] # For Redis cache
-    
+    satellites_data = []
+    postgis_update_args = []
+
     try:
         async with pool.acquire() as conn:
-            # *** MODIFIED QUERY: Added s.id ***
             satellites = await conn.fetch("""
                 SELECT 
                     s.id as satellite_db_id, 
@@ -79,8 +109,7 @@ async def fetch_and_calculate(pool):
                     s.norad_cat_id, 
                     t.line1, 
                     t.line2
-                FROM 
-                    satellites s
+                FROM satellites s
                 JOIN (
                     SELECT 
                         satellite_id, line1, line2,
@@ -89,93 +118,72 @@ async def fetch_and_calculate(pool):
                 ) t ON s.id = t.satellite_id
                 WHERE t.rn = 1;
             """)
-        
-        print(f"DB Fetch OK: Found {len(satellites)} satellites. Starting calculations...")
-        
+
+        print(f"DB Fetch OK: Found {len(satellites)} satellites.")
+
+        # --- Concurrently compute positions ---
         calculation_tasks = []
         for sat in satellites:
-            task = asyncio.to_thread(
-                calculate_satellite_position, sat['line1'], sat['line2']
-            )
+            task = asyncio.to_thread(calculate_satellite_position, sat['line1'], sat['line2'])
             calculation_tasks.append((sat, task))
 
-        # --- Lists for this cycle ---
-        all_eci_positions = []    # For Collision Analysis
-        all_satellite_info = []   # For Collision Analysis
-        
-        # --- *** NEW: List for executemany arguments *** ---
-        postgis_update_args = [] 
-
-        
-        # --- Calculation Loop (No DB connection needed here) ---
         for sat, task in calculation_tasks:
-            pos_data = await task # Get the result from the thread
-            
-            if pos_data:
-                eci_pos = pos_data["eci_pos"]
-                lat, lon, alt = pos_data["geo_pos"]
-                
-                # 1. Prepare data for the API Cache (same as before)
-                satellites_data.append({
-                    "name": sat['name'],
-                    "norad_id": sat['norad_cat_id'],
-                    "latitude": lat,
-                    "longitude": lon,
-                    "altitude": alt
-                })
-                
-                # 2. Store data for collision analysis
-                all_eci_positions.append(eci_pos)
-                all_satellite_info.append({
-                    "id": sat['satellite_db_id'],
-                    "name": sat['name'],
-                    "norad_id": sat['norad_cat_id']
-                })
+            pos_data = await task
+            if not pos_data:
+                continue
 
-                # 3. --- *** NEW: Append arguments for PostGIS update *** ---
-                # Arguments must be in order: $1 (lon), $2 (lat), $3 (id)
-                postgis_update_args.append(
-                    (lon, lat, sat['satellite_db_id'])
-                )
-        
-        # --- *** NEW: Run all DB updates in one batch *** ---
+            eci = pos_data["eci_pos"]
+            lat, lon, alt = pos_data["geo_pos"]
+
+            # Predict orbit samples
+            try:
+                samples = compute_future_samples(sat['line1'], sat['line2'])
+            except Exception as e:
+                print(f"Prediction error for {sat['name']}: {e}")
+                samples = []
+
+            satellites_data.append({
+                "id": sat['satellite_db_id'],
+                "name": sat['name'],
+                "norad_id": sat['norad_cat_id'],
+                "latitude": lat,
+                "longitude": lon,
+                "altitude": alt,
+                "eci": eci,
+                "samples": samples
+            })
+
+            # PostGIS update
+            postgis_update_args.append((lon, lat, sat['satellite_db_id']))
+
+        # --- Batch update PostGIS geopoints ---
         if postgis_update_args:
             async with pool.acquire() as conn:
                 try:
-                    await conn.executemany(
-                        """
+                    await conn.executemany("""
                         UPDATE satellites 
                         SET geopoint = ST_SetSRID(ST_MakePoint($1, $2), 4326)
                         WHERE id = $3
-                        """,
-                        postgis_update_args
-                    )
-                    print(f"PostGIS OK: Updated geopoints for {len(postgis_update_args)} satellites.")
+                    """, postgis_update_args)
+                    print(f"PostGIS OK: Updated {len(postgis_update_args)} satellites.")
                 except Exception as e:
-                    print(f"WORKER Error during PostGIS update: {e}")
+                    print(f"WORKER Error updating PostGIS: {e}")
 
-        
-        # --- Collision Analysis Section (Placeholder) ---
-        if all_eci_positions:
-            print(f"Collision Check: Built position list for {len(all_eci_positions)} satellites.")
-            # We will add the KDTree logic here in the next step
-            pass 
-            
-        print(f"Calculation OK: Processed {len(satellites_data)} satellites.")
-
-        # --- Write final result to Redis (same as before) ---
+        # --- Cache results in Redis ---
         if redis_client and satellites_data:
             json_data = json.dumps({"satellites": satellites_data})
             redis_client.set(CACHE_KEY, json_data, ex=CACHE_TTL_SECONDS)
             print("Cache Write OK: Updated satellite positions in Redis.")
 
+        print(f"Cycle complete. Processed {len(satellites_data)} satellites.")
+
     except (Exception, asyncpg.PostgresError) as error:
-        # This will catch errors from the initial .fetch()
-        print(f"WORKER Error in main cycle: {error}")
+        print(f"WORKER Error: {error}")
+
 
 async def main():
     """
-    Main worker loop. Connects to DB and runs the cycle.
+    Initialize connection pool, then run worker cycles continuously.
     """
     pool = None
     try:
@@ -189,12 +197,10 @@ async def main():
         print("WORKER Error: No Redis connection. Exiting.")
         return
 
-    # --- Main Loop ---
     while True:
         await fetch_and_calculate(pool)
-        print(f"Cycle complete. Sleeping for {CACHE_TTL_SECONDS} seconds...")
         await asyncio.sleep(CACHE_TTL_SECONDS)
 
+# --- Entry Point ---
 if __name__ == "__main__":
     asyncio.run(main())
-
