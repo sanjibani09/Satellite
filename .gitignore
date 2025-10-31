@@ -1,3 +1,6 @@
+# Ignore Ollama models folder
+ollama_models/
+
 # Ignore Python virtual environment
 myenv/
 
