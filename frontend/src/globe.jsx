@@ -2,11 +2,13 @@ import React, { useEffect, useRef, useState } from "react";
 import * as Cesium from "cesium";
 import "cesium/Build/Cesium/Widgets/widgets.css";
 import CesiumNavigation from "cesium-navigation-es6";
+import AnalysisPanel from "./AnalysisPanel";
 
 Cesium.Ion.defaultAccessToken =
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiIyYmMxMGJhYi04ODQ0LTQ1MWYtYjYxNC1jNDgyZGZjNTlkN2UiLCJpZCI6MzU0NDcyLCJpYXQiOjE3NjE1NzA3ODB9.ee6fK9oa_ScOtBnBnrJKMW1jZk2Zy2be8BUqwvYpIOY";
 
-const API_URL = "http://127.0.0.1:8000/api/v1/satellites";
+const SATELLITE_API_URL = "http://127.0.0.1:8000/api/v1/satellites";
+const ANALYSIS_API_URL = "http://127.0.0.1:8002/api/v1/analyze";
 
 function Globe() {
   const cesiumContainer = useRef(null);
@@ -14,9 +16,13 @@ function Globe() {
   const [satelliteData, setSatelliteData] = useState([]);
   const [showGroundStations, setShowGroundStations] = useState(true);
   const [showCoverage, setShowCoverage] = useState(true);
+  const [showAnalysisPanel, setShowAnalysisPanel] = useState(false);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
+  const [analysisResults, setAnalysisResults] = useState(null);
   const hasZoomed = useRef(false);
+  const analysisLayerRef = useRef(null);
 
-  // Sample ground stations (you can fetch from API later)
+  // Sample ground stations
   const groundStations = [
     { name: "Svalbard", lat: 78.2297, lon: 15.3926 },
     { name: "Kiruna", lat: 67.8558, lon: 20.2253 },
@@ -30,7 +36,7 @@ function Globe() {
     { name: "McMurdo", lat: -77.8419, lon: 166.6863 },
   ];
 
-  // 🌍 Initialize Cesium Viewer
+  // Initialize Cesium Viewer
   useEffect(() => {
     if (!cesiumContainer.current) return;
 
@@ -66,12 +72,12 @@ function Globe() {
     return () => cesiumViewer.destroy();
   }, []);
 
-  // 🛰 Fetch Satellite Data
+  // Fetch Satellite Data
   useEffect(() => {
     let intervalId;
     async function fetchData() {
       try {
-        const res = await fetch(API_URL);
+        const res = await fetch(SATELLITE_API_URL);
         const data = await res.json();
         setSatelliteData(data.satellites || []);
       } catch (err) {
@@ -83,11 +89,10 @@ function Globe() {
     return () => clearInterval(intervalId);
   }, []);
 
-  // 📡 Add Ground Stations
+  // Add Ground Stations
   useEffect(() => {
     if (!viewer) return;
 
-    // Remove old ground stations
     const stationsToRemove = viewer.entities.values.filter((entity) => {
       const id = entity.id;
       return typeof id === "string" && id.startsWith("ground_station_");
@@ -122,25 +127,24 @@ function Globe() {
     });
   }, [viewer, showGroundStations]);
 
-  // 🛰 Animate Satellites & Coverage
+  // Animate Satellites & Coverage (existing code)
   useEffect(() => {
     if (!viewer || satelliteData.length === 0) return;
 
-    // Remove old satellite entities
     const entitiesToRemove = viewer.entities.values.filter((entity) => {
       const id = entity.id;
       return (
         typeof id === "string" &&
         !id.endsWith("_orbit") &&
         !id.startsWith("ground_station_") &&
-        !id.endsWith("_coverage")
+        !id.endsWith("_coverage") &&
+        !id.startsWith("analysis_")
       );
     });
 
     entitiesToRemove.forEach((entity) => viewer.entities.remove(entity));
 
     const now = Cesium.JulianDate.now();
-
     viewer.clock.currentTime = now.clone();
     viewer.clock.clockRange = Cesium.ClockRange.LOOP_STOP;
     viewer.clock.multiplier = 1;
@@ -161,7 +165,6 @@ function Globe() {
       );
       if (valid.length < 2) return;
 
-      // Remove old entities for this specific satellite
       const satId = String(sat.norad_id);
       const orbitId = satId + "_orbit";
       const coverageId = satId + "_coverage";
@@ -172,7 +175,6 @@ function Globe() {
       const existingCoverage = viewer.entities.getById(coverageId);
       if (existingCoverage) viewer.entities.remove(existingCoverage);
 
-      // Create orbit path
       const orbitPositions = valid.map((s) =>
         Cesium.Cartesian3.fromDegrees(s.lon, s.lat, s.alt_km * 1000)
       );
@@ -190,9 +192,7 @@ function Globe() {
         },
       });
 
-      // Create moving satellite with time-based position
       const sampledPos = new Cesium.SampledPositionProperty();
-
       sampledPos.setInterpolationOptions({
         interpolationDegree: 5,
         interpolationAlgorithm: Cesium.LagrangePolynomialApproximation,
@@ -220,7 +220,6 @@ function Globe() {
         }
       });
 
-      // Add satellite entity
       viewer.entities.add({
         id: satId,
         name: sat.name,
@@ -246,7 +245,6 @@ function Globe() {
         },
       });
 
-      // Add coverage footprint
       if (showCoverage) {
         const avgAltKm =
           valid.reduce((sum, s) => sum + s.alt_km, 0) / valid.length;
@@ -275,7 +273,6 @@ function Globe() {
       }
     });
 
-    // Set clock bounds
     if (earliestTime && latestTime) {
       viewer.clock.startTime = earliestTime.clone();
       viewer.clock.stopTime = latestTime.clone();
@@ -290,14 +287,13 @@ function Globe() {
       }
     }
 
-    // Zoom to satellites once
     if (!hasZoomed.current && viewer.entities.values.length > 0) {
       viewer.zoomTo(viewer.entities);
       hasZoomed.current = true;
     }
   }, [viewer, satelliteData, showCoverage]);
 
-  // 👆 Click to show satellite info
+  // Click handler for satellite info
   useEffect(() => {
     if (!viewer) return;
     const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
@@ -337,37 +333,102 @@ function Globe() {
     return () => handler.destroy();
   }, [viewer]);
 
-  // Helper function to create ground station icon
+  // NEW: Analysis handler
+  const handleAnalyze = async (analysisRequest) => {
+    setAnalysisLoading(true);
+    setAnalysisResults(null);
+
+    try {
+      const response = await fetch(ANALYSIS_API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(analysisRequest),
+      });
+
+      if (response.ok) {
+        const data = await response.json();
+        setAnalysisResults(data);
+        
+        // Visualize AOI on globe
+        visualizeAnalysisAOI(analysisRequest.aoi_geojson, data);
+      } else {
+        alert('Analysis failed. Check console for details.');
+        console.error('Analysis error:', await response.text());
+      }
+    } catch (error) {
+      alert('Failed to connect to Analysis API');
+      console.error('Analysis error:', error);
+    } finally {
+      setAnalysisLoading(false);
+    }
+  };
+
+  // NEW: Visualize analysis AOI
+  const visualizeAnalysisAOI = (aoi, results) => {
+    if (!viewer) return;
+
+    // Remove previous analysis layer
+    if (analysisLayerRef.current) {
+      viewer.entities.remove(analysisLayerRef.current);
+    }
+
+    // Get color based on analysis type and results
+    let color = Cesium.Color.PURPLE;
+    if (results.analyses?.vegetation_health) {
+      const ndvi = results.analyses.vegetation_health.statistics?.NDVI_mean || 0;
+      color = ndvi > 0.6 ? Cesium.Color.GREEN :
+              ndvi > 0.3 ? Cesium.Color.YELLOW :
+              Cesium.Color.RED;
+    }
+
+    // Draw AOI polygon
+    const coords = aoi.coordinates[0];
+    analysisLayerRef.current = viewer.entities.add({
+      id: 'analysis_aoi',
+      name: 'Analysis Area',
+      polygon: {
+        hierarchy: Cesium.Cartesian3.fromDegreesArray(
+          coords.flat()
+        ),
+        material: color.withAlpha(0.3),
+        outline: true,
+        outlineColor: color,
+        outlineWidth: 2,
+        height: 0,
+      },
+    });
+
+    // Zoom to AOI
+    viewer.flyTo(analysisLayerRef.current);
+  };
+
+  // Helper functions
   function createGroundStationIcon() {
     const canvas = document.createElement("canvas");
     canvas.width = 64;
     canvas.height = 64;
     const ctx = canvas.getContext("2d");
 
-    // Draw antenna
     ctx.fillStyle = "#FF6B35";
     ctx.beginPath();
     ctx.arc(32, 48, 8, 0, Math.PI * 2);
     ctx.fill();
 
-    // Draw dish
     ctx.strokeStyle = "#FF6B35";
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.arc(32, 32, 16, 0, Math.PI, true);
     ctx.stroke();
 
-    // Draw stand
     ctx.fillStyle = "#FF6B35";
     ctx.fillRect(30, 32, 4, 16);
 
     return canvas.toDataURL();
   }
 
-  // Calculate coverage radius based on altitude
   function calculateCoverageRadius(altitudeKm) {
     const earthRadius = 6371;
-    const elevationAngle = 5; // minimum elevation angle in degrees
+    const elevationAngle = 5;
     const elevationRad = (elevationAngle * Math.PI) / 180;
 
     const maxRange =
@@ -411,14 +472,7 @@ function Globe() {
         <div style={{ marginBottom: "10px", fontWeight: "bold" }}>
           Context Layers
         </div>
-        <label
-          style={{
-            display: "flex",
-            alignItems: "center",
-            marginBottom: "8px",
-            cursor: "pointer",
-          }}
-        >
+        <label style={{ display: "flex", alignItems: "center", marginBottom: "8px", cursor: "pointer" }}>
           <input
             type="checkbox"
             checked={showGroundStations}
@@ -427,13 +481,7 @@ function Globe() {
           />
           Ground Stations
         </label>
-        <label
-          style={{
-            display: "flex",
-            alignItems: "center",
-            cursor: "pointer",
-          }}
-        >
+        <label style={{ display: "flex", alignItems: "center", marginBottom: "8px", cursor: "pointer" }}>
           <input
             type="checkbox"
             checked={showCoverage}
@@ -442,7 +490,25 @@ function Globe() {
           />
           Coverage Footprints
         </label>
+        <label style={{ display: "flex", alignItems: "center", cursor: "pointer" }}>
+          <input
+            type="checkbox"
+            checked={showAnalysisPanel}
+            onChange={(e) => setShowAnalysisPanel(e.target.checked)}
+            style={{ marginRight: "8px" }}
+          />
+          🧠 ML Analysis
+        </label>
       </div>
+
+      {/* Analysis Panel */}
+      {showAnalysisPanel && (
+        <AnalysisPanel
+          onAnalyze={handleAnalyze}
+          loading={analysisLoading}
+          results={analysisResults}
+        />
+      )}
     </div>
   );
 }

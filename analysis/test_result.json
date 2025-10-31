@@ -1,0 +1,55 @@
+{
+  "status": "success",
+  "image_date": "2025-10-25T05:29:21.025000+00:00",
+  "cloud_cover": 6.6e-05,
+  "analyses": {
+    "vegetation_health": {
+      "analysis_type": "vegetation_health",
+      "statistics": {
+        "mean_ndvi": 0,
+        "median_ndvi": 0,
+        "std_ndvi": 0,
+        "min_ndvi": 0,
+        "max_ndvi": 0
+      },
+      "classification": {
+        "healthy_percentage": 0,
+        "moderate_percentage": 0,
+        "stressed_percentage": 0,
+        "barren_percentage": 0,
+        "healthy_vegetation_km2": 0
+      },
+      "interpretation": "Minimal vegetation; predominantly barren or built-up land"
+    }
+  },
+  "aoi": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [
+          76.7,
+          30.7
+        ],
+        [
+          76.8,
+          30.7
+        ],
+        [
+          76.8,
+          30.8
+        ],
+        [
+          76.7,
+          30.8
+        ],
+        [
+          76.7,
+          30.7
+        ]
+      ]
+    ]
+  },
+  "time_period": "2025-10-01 to 2025-10-31",
+  "data_source": "Microsoft Planetary Computer (Sentinel-2) - FREE",
+  "timestamp": "2025-10-31T05:59:15.451256"
+}
